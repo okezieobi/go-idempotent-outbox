@@ -9,10 +9,17 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     retry_count INT NOT NULL DEFAULT 0,
     max_retries INT NOT NULL DEFAULT 5,
     last_error TEXT,
+    locked_by VARCHAR(255),
+    locked_until TIMESTAMPTZ,
     next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_outbox_processing ON outbox_events (status, next_retry_at, created_at) 
+-- Index for fetching pending and retryable failed work
+CREATE INDEX IF NOT EXISTS idx_outbox_processing ON outbox_events (status, next_retry_at, created_at) 
 WHERE status IN ('pending', 'failed');
+
+-- Index for background worker lease recovery
+CREATE INDEX IF NOT EXISTS idx_outbox_stuck_processing ON outbox_events (status, locked_until) 
+WHERE status = 'processing';
