@@ -1,160 +1,125 @@
 # Go Idempotent Outbox
 
-A small Go example that demonstrates the outbox pattern using PostgreSQL and a background worker pool. The project focuses on reliably publishing domain events by recording them in an outbox table and processing them asynchronously with retry, lease-based locking, and idempotent completion handling.
+A lightweight Go reference implementation of the Transactional Outbox pattern backed by PostgreSQL. It provides reliable, asynchronous event delivery with lease-based concurrency controls, exponential backoff retries, and automatic worker recovery.
 
 ## Overview
 
-The project is structured around a PostgreSQL-backed `outbox_events` table and a worker that polls for pending work, locks it, and executes the event handler. The design is intentionally simple and suitable as a reference implementation for a production-grade outbox processor.
+When executing database operations alongside external side effects (such as publishing to Kafka, calling payment webhooks, or dispatching emails), executing network calls inside an active database transaction can exhaust connection pools or lead to dual-write inconsistencies.
 
-Key characteristics:
+This library decouples transactional state from network delivery:
+1. Domain events are inserted into PostgreSQL within the local database transaction.
+2. An asynchronous worker pool polls for eligible events, acquires worker leases, and processes events.
+3. Events are marked completed upon successful execution or scheduled for retry with backoff upon failure.
 
-- Outbox events stored in PostgreSQL
-- Worker pool for batched processing
-- Lease-based locking to avoid duplicate processing
-- Retry with exponential backoff
-- Failed jobs can be reclaimed when a lease expires
-- Status tracking: `pending`, `processing`, `completed`, `failed`
+## Key Features
 
-## Project structure
+- **Lease-Based Locking:** Prevents concurrent workers from processing the same event.
+- **Worker Crash Recovery:** Stale jobs with expired leases are automatically reclaimed via `ReclaimStuckJobs`.
+- **Truncated Exponential Backoff:** Failed jobs are delayed before retrying to prevent overwhelming downstream services.
+- **Optimistic Ownership Guard:** Completion updates verify worker identity (`locked_by`), preventing stale workers from completing jobs whose lease has expired.
+
+## Project Structure
 
 ```text
 .
 ├── docker-compose.yml
 ├── go.mod
 ├── main/
-│   └── index.go
+│   └── index.go                   # Entrypoint & worker pool initialization
 ├── internal/
 │   ├── entities/
-│   │   └── outbox.go
+│   │   └── outbox.go              # Outbox entity definitions & status enum
 │   └── usecase/
-│       ├── process.repo.go
-│       ├── process.service.go
-│       └── process.worker.go
+│       ├── process.repo.go        # PostgreSQL query implementations & transactions
+│       ├── process.service.go     # Business execution logic & backoff calculations
+│       └── process.worker.go      # Concurrent worker pool & polling loops
 ├── migrations/
 │   └── 000001_create_outbox_table.up.sql
 └── README.md
 ```
 
-## Outbox workflow
+## Outbox Workflow
 
-1. An application stores an event in the `outbox_events` table as `pending`.
-2. A worker fetches a batch of eligible events.
-3. The worker updates the row to `processing` and sets a lock/lease using `locked_by` and `locked_until`.
-4. The event is executed.
-5. On success, the row is marked `completed`.
-6. On failure, the row is marked `failed` with a retry timestamp and exponential backoff delay.
-7. If a worker crashes or loses the lease, the row can be reclaimed and retried.
+```
+[ Domain Tx ] ──> INSERT INTO outbox_events (status: 'pending')
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────┐
+│ Worker Pool (process.worker.go)                        │
+│  1. Fetch & Lock (status: 'processing', set lease)      │
+│  2. Execute Handler                                     │
+│     ├─ Success ──> MarkComplete (assert locked_by)     │
+│     └─ Failure ──> MarkFailed (increment retry_count) │
+└────────────────────────────────────────────────────────┘
+```
 
-## Database schema
+## Database Schema
 
-The schema is defined in:
+Defined in `migrations/000001_create_outbox_table.up.sql`:
 
-- [migrations/000001_create_outbox_table.up.sql](migrations/000001_create_outbox_table.up.sql)
+```sql
+CREATE TABLE IF NOT EXISTS outbox_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    retry_count INT NOT NULL DEFAULT 0,
+    max_retries INT NOT NULL DEFAULT 5,
+    last_error TEXT,
+    locked_by VARCHAR(255),
+    locked_until TIMESTAMPTZ,
+    next_retry_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
 
-It creates a table with these important fields:
+## Getting Started
 
-- `id`
-- `event_id`
-- `event_type`
-- `payload`
-- `status`
-- `retry_count`
-- `max_retries`
-- `last_error`
-- `locked_by`
-- `locked_until`
-- `next_retry_at`
-- `created_at`
-- `updated_at`
+### Prerequisites
 
-## Prerequisites
+- **Go** `1.26+`
+- **Docker** and **Docker Compose**
+- **PostgreSQL 16** (supplied via Compose)
 
-- Go 1.26+
-- Docker and Docker Compose
-- PostgreSQL 16 (provided by the included compose file)
-
-## Getting started
-
-### 1. Start PostgreSQL
-
-From the project root:
+### 1. Start Database Container
 
 ```bash
 docker compose up -d
 ```
 
-This starts a PostgreSQL instance on:
+Starts PostgreSQL on `localhost:5432` with database `outbox_db`.
 
-- Host: `localhost`
-- Port: `5432`
-- Database: `outbox_db`
-- User: `postgres`
-- Password: `postgrespassword`
+### 2. Run Database Migrations
 
-### 2. Apply the schema
-
-The project includes the migration SQL in [migrations/000001_create_outbox_table.up.sql](migrations/000001_create_outbox_table.up.sql). You can load it manually with psql:
+Apply the migration schema using `psql`:
 
 ```bash
 psql "host=localhost port=5432 user=postgres password=postgrespassword dbname=outbox_db sslmode=disable" -f migrations/000001_create_outbox_table.up.sql
 ```
 
-### 3. Run the app
+### 3. Start the Worker Service
 
 ```bash
 go run ./main
 ```
 
-The app initializes the database connection, creates the repository, spins up a worker pool, and starts polling for outbox jobs.
+## Runtime Configuration
 
-## Runtime configuration
+Worker parameters are configured in `main/index.go`:
 
-The application currently configures the worker pool in [main/index.go](main/index.go):
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| **Batch Size** | `10` | Maximum number of events locked per poll cycle |
+| **Poll Interval** | `2s` | Wait duration between polling iterations |
+| **Lease Duration** | `30s` | Time window before a locked job is considered stuck |
 
-- Batch size: `10`
-- Poll interval: `2s`
-- Lease duration: `30s`
+## Retries & Safety Guarantees
 
-The connection string is also hardcoded in [main/index.go](main/index.go) to match the local Docker Postgres instance.
-
-## How the worker behaves
-
-The worker pool is implemented in [internal/usecase/process.worker.go](internal/usecase/process.worker.go):
-
-- It periodically fetches work from PostgreSQL.
-- It locks the work using a lease to avoid duplicate processing.
-- It executes each event through `executeEvent`.
-- It marks the event as completed or failed depending on the result.
-
-At the moment, `executeEvent` is a placeholder and returns `nil`. In a real implementation, this is where you would publish to Kafka, RabbitMQ, an HTTP webhook, or another downstream system.
-
-## Retry and locking model
-
-The repository logic in [internal/usecase/process.repo.go](internal/usecase/process.repo.go) handles the critical parts of the pattern:
-
-- `FetchAndLock`: selects pending or failed jobs due for retry and marks them as processing
-- `MarkComplete`: confirms completion only if the worker still owns the lease
-- `MarkFailed`: updates status, increments retries, and schedules a next retry time
-- `ReclaimStuckJobs`: resets any job whose lease has expired
-
-This protects the system from:
-
-- duplicate deliveries
-- worker crashes during processing
-- stale lease problems
-
-## Notes
-
-This repository is best viewed as a reference implementation rather than a full production messaging platform. It intentionally keeps the code small and understandable while demonstrating the core mechanics of an idempotent outbox processor.
-
-If you want to extend it, the next logical steps are:
-
-- add a real event dispatcher
-- support multiple event types with typed handlers
-- add an API or command layer to insert outbox records
-- integrate with Kafka, NATS, or another broker
-- add tests around retries and lease recovery
+- **Lost Lease Prevention:** If execution exceeds the `locked_until` threshold, another worker may reclaim the job. When the original worker attempts to call `MarkComplete`, the update fails because `locked_by` no longer matches, preserving data consistency.
+- **Exponential Backoff:** Failures calculate the next retry window as a function of `retry_count`, insulating external endpoints during outage spikes.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
