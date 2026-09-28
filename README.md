@@ -123,3 +123,12 @@ Worker parameters are configured in `main/index.go`:
 ## License
 
 This project is licensed under the MIT License.
+
+
+## Production Considerations
+
+To adapt this proof-of-concept into a shared internal Go library across multiple microservices:
+
+1. **Injectable Event Handler:** Refactor `WorkerPool` to accept a custom `EventHandler` function/interface (`func(context.Context, *OutboxEvent) error`) during initialization instead of hardcoding `executeEvent`.
+2. **Transactional Outbox Helper:** Provide a client method like `outbox.Save(ctx, tx, event)` so caller services can write outbox records within their local domain transactions without manual SQL queries.
+3. **Metrics & Telemetry:** Expose Prometheus counters for active lease recoveries (`ReclaimStuckJobs`), failed deliveries, and worker execution latencies.
